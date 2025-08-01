@@ -14,7 +14,7 @@
                     https://github.com/jenkinsci/bom?tab=readme-ov-file#depending-on-older-versions
                 -->
                 <artifactId>bom-${jenkins.baseline}.x</artifactId>
-                <version>4862.vc32a_71c3e731</version>
+                <version>5085.v05cc65a_936d3</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
