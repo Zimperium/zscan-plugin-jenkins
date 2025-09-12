@@ -72,7 +72,7 @@
 
     <groupId>io.jenkins.plugins</groupId>
     <artifactId>zscan-upload</artifactId>
-    <version>2.4.1-SNAPSHOT</version>
+    <version>2.4.1</version>
     <packaging>hpi</packaging>
     <properties>
         <!--
@@ -98,7 +98,8 @@
         <url>https://github.com/Zimperium/zscan-plugin-jenkins</url>
         <connection>scm:git:https://github.com/Zimperium/zscan-plugin-jenkins</connection>
         <developerConnection>scm:git:https://github.com/Zimperium/zscan-plugin-jenkins</developerConnection>
-    </scm>
+      <tag>zscan-upload-2.4.1</tag>
+  </scm>
     <!-- Assuming you want to host on @jenkinsci:
     <url>https://wiki.jenkins.io/display/JENKINS/TODO+Plugin</url>
     <scm>
