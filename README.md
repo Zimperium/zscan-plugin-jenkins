@@ -73,7 +73,7 @@ Opposite of above, provides ability to specify patterns to exclude files, multip
 
 #### Wait for Report
 
-If checked, the plugin will wait for an assessment report after uploading each binary. Reports take about 10 minutes to generate and the build step execution is paused while waiting. Report generation times out after 20 minutes to prevent 'stuck builds'.  If unchecked, the execution will move on to the next binary.  Reports can also be obtained from the zScan console
+If checked, the plugin will wait for an assessment report after uploading each binary. Reports take about 10 minutes to generate and the build step execution is paused while waiting. Report generation times out after 20 minutes to prevent 'stuck builds'; a timeout marks the build `UNSTABLE` and logs the upload `buildId` and the last status response. Transient status errors (HTTP 404/408/429/5xx) are retried, and repeated unexpected status payloads mark the build `UNSTABLE`. Once an assessment is complete, report downloads are retried for up to 20 minutes while the report becomes available. An assessment that reports `Failed` fails the build step immediately and logs the returned status payload. If unchecked, the execution will move on to the next binary. Reports can also be obtained from the zScan console.
 
 #### Report Format
 
@@ -134,3 +134,21 @@ SOFTWARE.
 ## Enhancements
 
 Submitting improvements to the plugin is welcomed and all pull requests will be approved by Zimperium after review.
+
+## Diagnosing upload/assessment failures
+
+The `scripts/zscan-upload-ab.sh` helper compares the two multipart payload shapes and polls the assessment endpoint to a terminal status. It requires `curl`, `jq`, and these environment variables: `ZSCAN_ENDPOINT`, `ZSCAN_CLIENT_ID`, and `ZSCAN_CLIENT_SECRET`. Do not put credentials directly on the command line.
+
+To compare against the plugin, first run the Jenkins step with the APK and record its logged `buildId`. Then run the minimal request:
+
+```sh
+scripts/zscan-upload-ab.sh minimal path/to/app.apk
+```
+
+For a direct-request control using the plugin's current CI metadata fields, run:
+
+```sh
+scripts/zscan-upload-ab.sh plugin-fields path/to/app.apk
+```
+
+The helper prints the `buildId`, each observed scan status, and the final raw status payload. zConsole may deduplicate uploads by APK content, so use separate eligible app builds or otherwise account for console deduplication when comparing results.

@@ -3,6 +3,7 @@ package com.zimperium.plugins.zDevJenkinsUploadPlugin;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 import com.zimperium.plugins.zDevJenkinsUploadPlugin.dtos.LoginCredentials;
 import com.zimperium.plugins.zDevJenkinsUploadPlugin.dtos.LoginResponse;
@@ -60,6 +61,13 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
     public final static int connectionTimeout = 2 * 60 * 1000;
     public final static int writeTimeout = 2 * 60 * 1000;
     public final static int readTimeout = 60 * 1000;
+    public final static long reportDownloadTimeout = 20 * 60 * 1000;
+    public final static int MAX_CONSECUTIVE_MALFORMED_STATUS = 3;
+
+    // Effective timings in milliseconds; package-private so tests can shorten them.
+    static long pollIntervalMillis = checkInterval * 1000;
+    static long statusTimeoutMillis = reportTimeout * 1000L;
+    static long reportDownloadTimeoutMillis = reportDownloadTimeout;
 
     public final static Result DEFAULT_STEP_RESULT = Result.FAILURE;
     public final static int MAX_FILES_UPLOAD = 5;
@@ -257,7 +265,11 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
         String authToken = "Bearer " + accessToken;
 
         int totalCount = 0;
+        boolean assessmentFailed = false;
         for (String startPath : expanded.split(",")) {
+            if (assessmentFailed) {
+                break;
+            }
             for (FilePath path : workspace.list(startPath, excluded)) {
 
                 // We don't support uploading directories
@@ -306,18 +318,19 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                         JsonObject jsonObject = JsonParser.parseString(uploadResponseBody.string()).getAsJsonObject();
 
                         // Extract the appId needed for team assignment, buildId to check report status, and the current team 
-                        String zdevAppId = (jsonObject.get("zdevAppId").isJsonNull()) ? "" : jsonObject.get("zdevAppId").getAsString();
-                        String teamId = (jsonObject.get("teamId").isJsonNull()) ? "" : jsonObject.get("teamId").getAsString();
-                        String buildId = (jsonObject.get("buildId").isJsonNull()) ? "" : jsonObject.get("buildId").getAsString();
+                        String zdevAppId = getStringOrEmpty(jsonObject, "zdevAppId");
+                        String teamId = getStringOrEmpty(jsonObject, "teamId");
+                        String buildId = getStringOrEmpty(jsonObject, "buildId");
+                        log(console, "Upload buildId: " + buildId + ", zdevAppId: " + zdevAppId
+                                + ", teamId: " + (teamId.isEmpty() ? "(none)" : teamId));
 
                         // If teamID is empty, find the correct team id by name
                         if(teamId.isEmpty()) {
-                            log(console, "Application " + zdevAppId + " does not belong to a team. Assigning it to the " + teamName + " team.");
+                            final String effectiveTeamName = effectiveTeamName(teamName);
+                            log(console, "Application " + zdevAppId + " does not belong to a team. Assigning it to the " + effectiveTeamName + " team.");
 
                             // need to wait a bit; otherwise we can get 404
-                            synchronized(this) {
-                                wait(checkInterval * 1000);
-                            }
+                            pause(pollIntervalMillis);
 
                             // get the list of teams to figure out team id
                             Call<ResponseBody> teamsCall = service.listTeams(authToken);
@@ -332,7 +345,7 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                                         for (JsonElement teamElement : teamArray) {
                                             String name = teamElement.getAsJsonObject().get("name").getAsString();
                                             // log(console, "Team " + name);
-                                            if(name.equals(teamName)){
+                                            if(name.equals(effectiveTeamName)){
                                                 teamId = teamElement.getAsJsonObject().get("id").getAsString();
                                                 //log(console, "Found team with ID: " + teamId);
                                                 break;
@@ -340,12 +353,12 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                                         }
                                         
                                         // if we did not find the specified team, try 'Default'
-                                        if(teamId.isEmpty() && !teamName.equals("Default")) {
-                                            log(console, "Team " + teamName + " not found.  Trying the 'Default' team.");
+                                        if(teamId.isEmpty() && !effectiveTeamName.equals(DEFAULT_TEAM_NAME)) {
+                                            log(console, "Team " + effectiveTeamName + " not found.  Trying the 'Default' team.");
                                             for (JsonElement teamElement : teamArray) {
                                                 String name = teamElement.getAsJsonObject().get("name").getAsString();
                                                 // log(console, "Team " + name);
-                                                if(name.equals("Default")){
+                                                if(name.equals(DEFAULT_TEAM_NAME)){
                                                     teamId = teamElement.getAsJsonObject().get("id").getAsString();
                                                     log(console, "Found team with ID: " + teamId);
                                                     break;
@@ -404,7 +417,7 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                             }
                         }
                         else {
-                            log(console, "Application " + zdevAppId + " already belongs to team " + teamId );
+                            log(console, "Upload response reports application " + zdevAppId + " is already assigned to team " + teamId + "; skipping team assignment.");
                         }
 
                         // report may have taken a long time; refresh the access token
@@ -423,73 +436,132 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                         String assessmentId = "";
                         // wait for the report, if configured
                         if(waitForReport) {
-                            start = System.currentTimeMillis();
-                            end = start + reportTimeout * 1000;
-                            while( System.currentTimeMillis() < end ) {
+                            long statusDeadline = System.currentTimeMillis() + statusTimeoutMillis;
+                            int consecutiveMalformed = 0;
+                            boolean statusError = false;
+                            String lastStatusText = null;
+                            while( System.currentTimeMillis() < statusDeadline ) {
                                 Call<ResponseBody> statusCall = service.checkStatus(buildId, authToken);
                                 Response<ResponseBody> statusResponse = statusCall.execute();
                                 if(statusResponse.isSuccessful()) {
+                                    String statusText;
                                     try(ResponseBody statusBody = statusResponse.body()) {
-                                        // we're inside the try() block; exceptions will be caught
-                                        @SuppressWarnings("null")
-                                        JsonObject statusObject = JsonParser.parseString(statusBody.string()).getAsJsonObject();
-                                        String scanStatus = statusObject.getAsJsonObject("zdevMetadata").get("analysis").getAsString();
-                                        log(console, "Scan status = " + scanStatus);
+                                        statusText = (statusBody != null) ? statusBody.string() : "";
+                                    }
+                                    lastStatusText = statusText;
+                                    JsonObject statusObject = parseJsonObject(statusText);
+                                    AnalysisState state = interpretStatus(statusObject);
 
-                                        if(scanStatus.equals("Done")) {
-                                            assessmentId = statusObject.get("id").getAsString();
-                                            // need to pause before continuing to make sure reports are available
-                                            log(console, "Waiting for the report to become available...");
-                                            synchronized(this) {
-                                                wait(checkInterval * 1000);
-                                            }
+                                    if(state == AnalysisState.MALFORMED) {
+                                        consecutiveMalformed++;
+                                        log(console, "Unexpected assessment status response (" + consecutiveMalformed + "/"
+                                                + MAX_CONSECUTIVE_MALFORMED_STATUS + "): " + statusText);
+                                        if(consecutiveMalformed >= MAX_CONSECUTIVE_MALFORMED_STATUS) {
+                                            log(console, "Giving up on assessment status for buildId " + buildId + ".");
+                                            run.setResult(Result.UNSTABLE);
+                                            statusError = true;
                                             break;
                                         }
                                     }
-                                    catch(Exception e) {
-                                        log(console, "Unexpected exception: " + e.getLocalizedMessage());
-                                        run.setResult(Result.UNSTABLE);
-                                        break;
+                                    else {
+                                        consecutiveMalformed = 0;
+                                        log(console, "Scan status = " + getAnalysis(statusObject));
+
+                                        if(state == AnalysisState.FAILED) {
+                                            log(console, "zScan analysis reported Failed for buildId " + buildId
+                                                    + ". The assessment did not produce reports. Status response: " + statusText);
+                                            run.setResult(Result.FAILURE);
+                                            assessmentFailed = true;
+                                            break;
+                                        }
+
+                                        if(state == AnalysisState.DONE) {
+                                            assessmentId = statusObject.get("id").getAsString();
+                                            // need to pause before continuing to make sure reports are available
+                                            log(console, "Waiting for the report to become available...");
+                                            pause(pollIntervalMillis);
+                                            break;
+                                        }
                                     }
                                 }
-                                else if (statusResponse.code() != 404) {
-                                    log(console, "Unable to get assessment report. Please check credentials and try again.");
+                                else if (shouldRetryForStatus(statusResponse.code())) {
+                                    log(console, "Assessment status is not available yet (HTTP " + statusResponse.code() + "); retrying.");
+                                    ResponseBody statusBody = statusResponse.errorBody();
+                                    if(statusBody != null) {
+                                        statusBody.close();
+                                    }
+                                }
+                                else {
+                                    log(console, "Unable to get assessment status for buildId " + buildId + ". Please check credentials and try again.");
                                     ResponseBody statusBody = statusResponse.errorBody();
                                     if(statusBody != null) {
                                         log(console, "HTTP " + statusResponse.code() + ": " + statusBody.string());
                                     }
                                     run.setResult(Result.UNSTABLE);
-                                    // move on to the next one
+                                    statusError = true;
                                     break;
                                 }
-                                
-                                synchronized(this) {
-                                    wait(checkInterval * 1000);
+
+                                long remaining = statusDeadline - System.currentTimeMillis();
+                                if(remaining > 0) {
+                                    pause(Math.min(pollIntervalMillis, remaining));
                                 }
                             }
 
-                            // report may have taken a long time; refresh the access token
-                            refreshTokenCall = service.refreshAccess(new RefreshCredentials(refreshToken));
-                            tokenResponse = refreshTokenCall.execute();
-                            tokenResponseBody = tokenResponse.body();
-                    
-                            if (!tokenResponse.isSuccessful() || tokenResponseBody == null) {
-                                log(console, "Unable to refresh access token. Will continue using the original.");
-                            }
-                            else {
-
-                                String newAccessToken = tokenResponseBody.getAccessToken();
-                                refreshToken = tokenResponseBody.getRefreshToken();
-                                authToken = "Bearer " + newAccessToken;
+                            if(!assessmentFailed && !statusError && assessmentId.isEmpty()) {
+                                log(console, "Timeout (" + (statusTimeoutMillis / (60 * 1000)) + " min) waiting for the assessment of buildId "
+                                        + buildId + " to complete. Last status response: " + lastStatusText);
+                                run.setResult(Result.UNSTABLE);
                             }
 
-                            if(!assessmentId.isEmpty()) {
+                            if (!assessmentFailed && !assessmentId.isEmpty()) {
+                                // report may have taken a long time; refresh the access token
+                                refreshTokenCall = service.refreshAccess(new RefreshCredentials(refreshToken));
+                                tokenResponse = refreshTokenCall.execute();
+                                tokenResponseBody = tokenResponse.body();
+
+                                if (!tokenResponse.isSuccessful() || tokenResponseBody == null) {
+                                    log(console, "Unable to refresh access token. Will continue using the original.");
+                                }
+                                else {
+
+                                    String newAccessToken = tokenResponseBody.getAccessToken();
+                                    refreshToken = tokenResponseBody.getRefreshToken();
+                                    authToken = "Bearer " + newAccessToken;
+                                }
+                            }
+
+                            if(!assessmentFailed && !assessmentId.isEmpty()) {
                                 // get the actual report
                                 log(console, "Retrieving report for assessment " + assessmentId);
                                 String reportFormatString = reportFormat.getDescription().toLowerCase();
 
-                                Call<ResponseBody> reportCall = service.downloadReport(assessmentId, reportFormatString, authToken);
-                                Response<ResponseBody> reportResponse = reportCall.execute();
+                                Call<ResponseBody> reportCall = null;
+                                Response<ResponseBody> reportResponse = null;
+                                long downloadDeadline = System.currentTimeMillis() + reportDownloadTimeoutMillis;
+                                do {
+                                    reportCall = service.downloadReport(assessmentId, reportFormatString, authToken);
+                                    reportResponse = reportCall.execute();
+                                    if (reportResponse.isSuccessful()
+                                            || !shouldRetryForReportDownload(reportResponse.code())
+                                            || System.currentTimeMillis() >= downloadDeadline) {
+                                        break;
+                                    }
+
+                                    log(console, "Report is not ready (HTTP " + reportResponse.code()
+                                            + "). Retrying for up to " + (reportDownloadTimeoutMillis / (60 * 1000))
+                                            + " minutes.");
+                                    ResponseBody errorBody = reportResponse.errorBody();
+                                    if (errorBody != null) {
+                                        errorBody.close();
+                                    }
+
+                                    long remaining = downloadDeadline - System.currentTimeMillis();
+                                    if (remaining > 0) {
+                                        pause(Math.min(pollIntervalMillis, remaining));
+                                    }
+                                } while (System.currentTimeMillis() < downloadDeadline);
+
                                 ResponseBody reportResponseBody = reportResponse.body();
 
                                 if(reportResponse.isSuccessful() && reportResponseBody != null) {
@@ -542,6 +614,10 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                                 }
                                 else {
                                     log(console, "Report failed to download: HTTP" + reportResponse.code() + ": " + reportCall.request().url());
+                                    ResponseBody errorBody = reportResponse.errorBody();
+                                    if (errorBody != null) {
+                                        log(console, "Report download error: " + errorBody.string());
+                                    }
                                     run.setResult(Result.UNSTABLE);
                                 }
                             }
@@ -577,10 +653,81 @@ public class ZDevUploadPlugin extends Recorder implements SimpleBuildStep{
                 if(totalCount >= MAX_FILES_UPLOAD) {
                     break;
                 }
+                if (assessmentFailed) {
+                    break;
+                }
             }
         }
         log(console, totalCount + " file(s) were uploaded.");
-        run.setResult(Result.SUCCESS);
+        if (run.getResult() == null || Result.SUCCESS.equals(run.getResult())) {
+            run.setResult(Result.SUCCESS);
+        }
+    }
+
+    static String effectiveTeamName(String teamName) {
+        return (teamName == null || teamName.trim().isEmpty()) ? DEFAULT_TEAM_NAME : teamName.trim();
+    }
+
+    enum AnalysisState { PENDING, DONE, FAILED, MALFORMED }
+
+    static AnalysisState interpretStatus(JsonObject statusObject) {
+        String analysis = getAnalysis(statusObject);
+        if (analysis == null || analysis.isEmpty()) {
+            return AnalysisState.MALFORMED;
+        }
+        if ("Failed".equals(analysis)) {
+            return AnalysisState.FAILED;
+        }
+        if ("Done".equals(analysis)) {
+            return getStringOrEmpty(statusObject, "id").isEmpty() ? AnalysisState.MALFORMED : AnalysisState.DONE;
+        }
+        return AnalysisState.PENDING;
+    }
+
+    static boolean isFailedAnalysis(JsonObject statusObject) {
+        return interpretStatus(statusObject) == AnalysisState.FAILED;
+    }
+
+    static String getAnalysis(JsonObject statusObject) {
+        if (statusObject == null || !statusObject.has("zdevMetadata") || !statusObject.get("zdevMetadata").isJsonObject()) {
+            return null;
+        }
+        JsonElement analysis = statusObject.getAsJsonObject("zdevMetadata").get("analysis");
+        return (analysis != null && analysis.isJsonPrimitive()) ? analysis.getAsString() : null;
+    }
+
+    static String getStringOrEmpty(JsonObject object, String key) {
+        if (object == null) {
+            return "";
+        }
+        JsonElement value = object.get(key);
+        return (value != null && value.isJsonPrimitive()) ? value.getAsString() : "";
+    }
+
+    static JsonObject parseJsonObject(String text) {
+        try {
+            JsonElement element = JsonParser.parseString(text);
+            return element.isJsonObject() ? element.getAsJsonObject() : null;
+        }
+        catch (JsonParseException e) {
+            return null;
+        }
+    }
+
+    static boolean shouldRetryForStatus(int responseCode) {
+        return responseCode == 404 || responseCode == 408 || responseCode == 429
+                || responseCode == 500 || responseCode == 502 || responseCode == 503 || responseCode == 504;
+    }
+
+    private static void pause(long millis) throws InterruptedException {
+        if (millis > 0) {
+            Thread.sleep(millis);
+        }
+    }
+
+    static boolean shouldRetryForReportDownload(int responseCode) {
+        return responseCode == 404 || responseCode == 408 || responseCode == 425 || responseCode == 429
+                || responseCode == 500 || responseCode == 502 || responseCode == 503 || responseCode == 504;
     }
 
     @Override

@@ -1,2 +1,2 @@
 <?jelly escape-by-default='true'?>
-<div>Team name to assign applications to. This setting is only relevant when uploading an application for the first time.</div>
+<div>Team name to assign applications to. If left blank, or if no team with this name exists, the 'Default' team is used. This setting is only relevant when uploading an application for the first time.</div>
